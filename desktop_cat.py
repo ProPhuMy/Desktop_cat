@@ -6,6 +6,8 @@ from tkinter import scrolledtext
 import google.generativeai as genai  # <<< ADDED: Gemini library
 import threading  # <<< ADDED: Library to run API calls in a separate thread to avoid blocking the GUI
 import customtkinter as ctk
+import csv  # <<< ADDED: For chat history saving
+import datetime  # <<< ADDED: For timestamps in chat history
 
 # --- Helper function for PyInstaller path handling ---
 def resource_path(relative_path):
@@ -35,8 +37,36 @@ class DesktopPetApp:
 
         screen_width = self.master.winfo_screenwidth()
         screen_height = self.master.winfo_screenheight()
-        self.x = screen_width // 2 - 50
-        self.y = screen_height - 150
+        
+        # Calculate position accounting for taskbar and scaling
+        # Get the actual working area (excludes taskbar)
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # Get working area (screen minus taskbar)
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long),
+                           ("top", ctypes.c_long),
+                           ("right", ctypes.c_long),
+                           ("bottom", ctypes.c_long)]
+            
+            rect = RECT()
+            ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
+            
+            working_height = rect.bottom - rect.top
+            working_width = rect.right - rect.left
+            
+            # Position Neko on the taskbar (just above working area)
+            self.x = working_width // 2 - 50
+            self.y = working_height - 100  # 100px from bottom of working area (on taskbar)
+            
+        except Exception as e:
+            print(f"Could not get working area, using fallback positioning: {e}")
+            # Fallback: assume standard taskbar height of about 40-50px
+            taskbar_height = 50
+            self.x = screen_width // 2 - 50
+            self.y = screen_height - taskbar_height - 100  # Position above taskbar
 
         # Ensure initial position is clamped to the visible area
         self.cycle = 0
@@ -51,6 +81,9 @@ class DesktopPetApp:
         self.drag_start_x = 0
         self.drag_start_y = 0
         self.chat_window = None
+        self.chat_history_file = os.path.join(os.path.dirname(__file__), "chat_history", "neko_chat_history.csv")  # <<< MODIFIED: Single file
+        self.current_session_messages = []  # <<< ADDED: Store messages for current session
+        self.session_start_time = None  # <<< ADDED: Track when session started
 
         # Load GIF frames
         self.idle = [tk.PhotoImage(file=resource_path('image/idle.gif'), format='gif -index %i' % (i)) for i in range(5)]
@@ -221,6 +254,10 @@ class DesktopPetApp:
         if self.chat_window is not None and self.chat_window.winfo_exists():
             self.chat_window.lift()
             return
+        
+        # <<< ADDED: Create new chat history file for this session
+        self._create_new_chat_session()
+        
         # Theme setup
         ctk.set_appearance_mode("dark")   # "dark", "light", "system"
         ctk.set_default_color_theme("blue")  # "blue", "green", "dark-blue"
@@ -230,6 +267,9 @@ class DesktopPetApp:
         self.chat_window.geometry("500x600")
         self.chat_window.title("Chat with Neko")
         self.chat_window.attributes("-topmost", True)
+        
+        # <<< ADDED: Handle window close event to save session
+        self.chat_window.protocol("WM_DELETE_WINDOW", self._on_chat_window_close)
 
         # Khung chat hiển thị tin nhắn
         self.chat_display = ctk.CTkTextbox(
@@ -261,6 +301,62 @@ class DesktopPetApp:
         )
         self.send_button.pack(side="right")
 
+    def _create_new_chat_session(self):
+        """Starts a new chat session by initializing message storage."""
+        # Create chat_history directory if it doesn't exist
+        history_dir = os.path.join(os.path.dirname(__file__), "chat_history")
+        if not os.path.exists(history_dir):
+            os.makedirs(history_dir)
+        
+        # Initialize session
+        self.current_session_messages = []
+        self.session_start_time = datetime.datetime.now()
+        
+        # Create CSV file with header if it doesn't exist
+        if not os.path.exists(self.chat_history_file):
+            with open(self.chat_history_file, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow(['Session_Start_Time', 'Complete_Chat_History'])
+        
+        print(f"New chat session started at: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def _save_message_to_history(self, sender, message):
+        """Stores a message in the current session (doesn't save to file yet)."""
+        if self.current_session_messages is None:
+            return
+        
+        try:
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            formatted_message = f"[{timestamp}] {sender}: {message}"
+            self.current_session_messages.append(formatted_message)
+                
+        except Exception as e:
+            print(f"Error storing message: {e}")
+
+    def _save_complete_session(self):
+        """Saves the entire chat session as one row in the CSV file."""
+        if not self.current_session_messages or not self.session_start_time:
+            return
+        
+        try:
+            # Join all messages with line breaks to create one complete conversation
+            complete_conversation = " | ".join(self.current_session_messages)
+            session_timestamp = self.session_start_time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Append the complete session to the CSV file
+            with open(self.chat_history_file, 'a', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow([session_timestamp, complete_conversation])
+            
+            print(f"Saved complete chat session ({len(self.current_session_messages)} messages)")
+            
+            # Clear session data
+            self.current_session_messages = []
+            self.session_start_time = None
+                
+        except Exception as e:
+            print(f"Error saving complete session: {e}")
+
 
     def send_chat_message(self):
         """Handles sending the user message to Gemini in a separate thread."""
@@ -271,6 +367,9 @@ class DesktopPetApp:
         # Hiển thị tin nhắn user
         self._insert_chat_message(f"You: {user_message}\n")
         self.user_input_entry.delete(0, tk.END)
+        
+        # <<< ADDED: Save user message to history
+        self._save_message_to_history("User", user_message)
 
         # Tạm disable input
         self.user_input_entry.configure(state="disabled")
@@ -308,6 +407,9 @@ class DesktopPetApp:
 
         # Thêm câu trả lời thật
         self._insert_chat_message(f"Neko: {neko_response}\n\n")
+        
+        # <<< ADDED: Save Neko's response to history
+        self._save_message_to_history("Neko", neko_response)
 
         # Bật lại input
         self.user_input_entry.configure(state="normal")
@@ -321,14 +423,41 @@ class DesktopPetApp:
         self.chat_display.see("end")  # luôn cuộn xuống cuối
         self.chat_display.configure(state="disabled")
 
-    def close_chat_window(self, win):
-        win.destroy()
+    def _on_chat_window_close(self):
+        """Handle chat window close event - save the complete session."""
+        self._save_complete_session()
+        self.chat_window.destroy()
         self.chat_window = None
+
+    def close_chat_window(self, win):
+        """Legacy method - now calls the proper close handler."""
+        self._on_chat_window_close()
 
     def quit_app(self):
         self.master.destroy()
 
     # ------------------ New helper methods for clamping & sizes ------------------
+    def _get_working_area(self):
+        """Get the working area (screen minus taskbar) dimensions."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long),
+                           ("top", ctypes.c_long),
+                           ("right", ctypes.c_long),
+                           ("bottom", ctypes.c_long)]
+            
+            rect = RECT()
+            ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
+            
+            return rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            # Fallback to screen size minus estimated taskbar
+            screen_w, screen_h = self._get_screen_size()
+            return screen_w, screen_h - 50  # Assume 50px taskbar
+
     def _get_screen_size(self):
         self.master.update_idletasks()
         return self.master.winfo_screenwidth(), self.master.winfo_screenheight()
@@ -355,12 +484,12 @@ class DesktopPetApp:
         return pet_w, pet_h
 
     def _clamp_position(self):
-        """Clamp self.x/self.y so the pet stays inside the visible screen area."""
-        screen_w, screen_h = self._get_screen_size()
+        """Clamp self.x/self.y so the pet stays inside the working area (excludes taskbar)."""
+        working_w, working_h = self._get_working_area()
         pet_w, pet_h = self._get_pet_size()
 
-        min_x, max_x = 0, max(0, screen_w - pet_w)
-        min_y, max_y = 0, max(0, screen_h - pet_h)
+        min_x, max_x = 0, max(0, working_w - pet_w)
+        min_y, max_y = 0, max(0, working_h - pet_h)
 
         self.x = max(min_x, min(self.x, max_x))
         self.y = max(min_y, min(self.y, max_y))
